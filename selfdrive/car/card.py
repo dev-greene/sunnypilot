@@ -79,6 +79,10 @@ class Car:
     self.CS_prev = car.CarState.new_message()
     self.CS_SP_prev = custom.CarStateSP.new_message()
     self.initialized_prev = False
+    # Pre-set grace period to suppress canTimeout during ECU knockout at init.
+    # init() runs in controls_update() AFTER state_update(), so we need the grace
+    # active before the first state_update to prevent canBusMissing on the init cycle.
+    self._init_grace_frames = int(30.0 / DT_CTRL)  # 30 second grace period (diagnostic test)
 
     self.last_actuators_output = structs.CarControl.Actuators()
 
@@ -198,6 +202,13 @@ class Car:
     CS, CS_SP = self.CI.update(can_list)
     CS_SP = convert_to_capnp(CS_SP)
 
+    # Suppress canTimeout during grace period after ECU knockout init.
+    if self._init_grace_frames > 0:
+      CS.canTimeout = False
+      self._init_grace_frames -= 1
+      for cp in self.CI.can_parsers.values():
+        cp.reset_bus_timeout()
+
     # Update radar tracks from CAN
     RD: structs.RadarDataT | None = self.RI.update(can_list)
 
@@ -271,8 +282,12 @@ class Car:
 
     if not self.initialized_prev:
       # Initialize CarInterface, once controls are ready
-      # TODO: this can make us miss at least a few cycles when doing an ECU knockout
       self.CI.init(self.CP, self.CP_SP, *self.can_callbacks)
+      # Reset parser bus_timeout after ECU knockout to prevent transient CAN
+      # silence from triggering permanent canBusMissing
+      self._init_grace_frames = int(2.0 / DT_CTRL)  # 2 second grace period
+      for cp in self.CI.can_parsers.values():
+        cp.reset_bus_timeout()
       # signal pandad to switch to car safety mode
       self.params.put_bool_nonblocking("ControlsReady", True)
 
